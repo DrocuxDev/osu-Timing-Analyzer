@@ -1,0 +1,10 @@
+node_modules/
+*.osz
+*.osu
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+.DS_Store
+Thumbs.db

@@ -1,0 +1,26 @@
+{
+  "name": "osu-timing",
+  "version": "1.0.0",
+  "description": "Analizador de audio por terminal para osu! - Detecta BPM, Offset, Compás y cambios dinámicos de tempo/compás (Timing Points)",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "osu-timing": "./bin/osu-timing.js"
+  },
+  "scripts": {
+    "start": "node ./bin/osu-timing.js",
+    "test": "node ./test/run-tests.js"
+  },
+  "keywords": [
+    "osu",
+    "bpm",
+    "offset",
+    "timing-points",
+    "time-signature",
+    "rhythm-game",
+    "audio-analysis"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
