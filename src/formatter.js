@@ -3,6 +3,12 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { formatMsToTimestamp } from './analyzer.js';
 import { createZipArchive } from './zip.js';
+import {
+  parseTimingPointLine,
+  sortTimingPoints,
+  formatTimingPointToOsuLine,
+  parseOsuFile
+} from './osu-parser.js';
 
 const COLORS = {
   reset: '\x1b[0m',
@@ -317,32 +323,89 @@ export async function exportToOszPackage(targetOszPath, audioFilePath, analysis)
 }
 
 /**
- * Inyecta o reemplaza la seccion [TimingPoints] dentro de un archivo .osu existente,
+ * Inyecta o reemplaza la seccion [TimingPoints] dentro de un archivo .osu existente
+ * preservando todos los puntos heredados (lineas verdes / SV / Kiai / Volumen) y
+ * garantizando que en timestamps identicos la linea roja preceda a la linea verde,
  * o crea una plantilla .osu lista para abrir en el editor de osu!
  */
 export function exportToOsuFile(targetOsuPath, audioFilePath, analysis) {
+  if (!analysis || !Array.isArray(analysis.timingPoints) || analysis.timingPoints.length === 0) {
+    throw new Error('El objeto analysis no contiene timingPoints validos para exportar.');
+  }
+
   const resolvedOsu = path.resolve(targetOsuPath);
-  const timingLines = analysis.timingPoints.map((tp) => tp.osuTimingPointLine).join('\n');
+  const newRedPoints = analysis.timingPoints.map((tp, idx) => {
+    const lineStr =
+      typeof tp.osuTimingPointLine === 'string' && tp.osuTimingPointLine.trim() !== ''
+        ? tp.osuTimingPointLine
+        : formatTimingPointToOsuLine({
+            time: tp.offsetMs ?? tp.time ?? 0,
+            beatLength: tp.beatLengthMs ?? tp.beatLength ?? 60000 / (tp.bpm || 120),
+            meter: tp.meter ?? 4,
+            uninherited: 1
+          });
+    const parsed = parseTimingPointLine(lineStr, idx);
+    return {
+      ...parsed,
+      osuTimingPointLine: lineStr
+    };
+  });
 
   if (fs.existsSync(resolvedOsu)) {
     const content = fs.readFileSync(resolvedOsu, 'utf8');
-    if (content.includes('[TimingPoints]')) {
-      const updated = content.replace(
-        /\[TimingPoints\][\s\S]*?(?=\r?\n\[|$)/,
-        `[TimingPoints]\n${timingLines}\n`
-      );
-      fs.writeFileSync(resolvedOsu, updated, 'utf8');
-      return { mode: 'updated', path: resolvedOsu };
+    const lineEnding = content.includes('\r\n') ? '\r\n' : '\n';
+    const parsedExisting = parseOsuFile(content, { strict: false });
+
+    // Preservar todas las lineas verdes (uninherited = 0) existentes en el mapa
+    const mergedPoints = sortTimingPoints([...newRedPoints, ...parsedExisting.inheritedPoints]);
+    const timingLines = mergedPoints.map(formatTimingPointToOsuLine).join(lineEnding);
+
+    if (parsedExisting.hasTimingPointsSection) {
+      const lines = content.split(/\r?\n/);
+      const outputLines = [];
+      let inTimingSection = false;
+      let replaced = false;
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        const isSectionHeader = /^\[([A-Za-z0-9_]+)\]$/.test(trimmed);
+
+        if (isSectionHeader) {
+          if (trimmed === '[TimingPoints]') {
+            inTimingSection = true;
+            if (!replaced) {
+              outputLines.push('[TimingPoints]');
+              outputLines.push(timingLines);
+              replaced = true;
+            }
+            continue;
+          } else if (inTimingSection) {
+            inTimingSection = false;
+            outputLines.push('');
+          }
+        }
+
+        if (!inTimingSection) {
+          outputLines.push(line);
+        }
+      }
+
+      fs.writeFileSync(resolvedOsu, outputLines.join(lineEnding), 'utf8');
+      return {
+        mode: 'updated',
+        path: resolvedOsu,
+        preservedGreenLines: parsedExisting.inheritedPoints.length
+      };
     } else {
-      const updated = `${content.trimEnd()}\n\n[TimingPoints]\n${timingLines}\n`;
+      const updated = `${content.trimEnd()}${lineEnding}${lineEnding}[TimingPoints]${lineEnding}${timingLines}${lineEnding}`;
       fs.writeFileSync(resolvedOsu, updated, 'utf8');
-      return { mode: 'appended', path: resolvedOsu };
+      return { mode: 'appended', path: resolvedOsu, preservedGreenLines: 0 };
     }
   } else {
     const audioFileName = path.basename(audioFilePath);
     const baseName = path.basename(audioFilePath, path.extname(audioFilePath));
     const content = generateOsuFileContent(baseName, audioFileName, analysis);
     fs.writeFileSync(resolvedOsu, content, 'utf8');
-    return { mode: 'created', path: resolvedOsu };
+    return { mode: 'created', path: resolvedOsu, preservedGreenLines: 0 };
   }
 }
