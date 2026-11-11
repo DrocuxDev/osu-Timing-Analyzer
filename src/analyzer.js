@@ -17,28 +17,113 @@
  *    para nunca contaminar mapas estandar con docenas de lineas rojas con ±0.1 BPM de fluctuacion.
  */
 
+function sanitizeAnalyzeOptions(options = {}) {
+  const parsePositiveOrFallback = (val, fallback, minVal, maxVal) => {
+    const n = Number(val);
+    if (!Number.isFinite(n) || n <= 0) return fallback;
+    return Math.min(maxVal, Math.max(minVal, n));
+  };
+
+  let minBpm = parsePositiveOrFallback(options.minBpm, 60, 0.01, 1000000);
+  let maxBpm = parsePositiveOrFallback(options.maxBpm, 260, 0.01, 1000000);
+  if (minBpm > maxBpm) {
+    const tmp = minBpm;
+    minBpm = maxBpm;
+    maxBpm = tmp;
+  }
+
+  const rawStartAt = Number(options.startAt ?? options.skipIntro ?? 0);
+  const startAtSec = Number.isFinite(rawStartAt) && rawStartAt >= 0 ? rawStartAt : 0;
+
+  const rawSensitivity = Number(options.sensitivity ?? 0.5);
+  const sensitivity = Number.isFinite(rawSensitivity) ? Math.min(1, Math.max(0, rawSensitivity)) : 0.5;
+
+  let targetBpm = null;
+  const rawTarget = options.bpm ?? options.targetBpm ?? null;
+  if (rawTarget !== null && rawTarget !== undefined && String(rawTarget).trim() !== '') {
+    const parsedTarget = Number(rawTarget);
+    if (!Number.isFinite(parsedTarget) || parsedTarget <= 0) {
+      throw new RangeError(
+        `El BPM objetivo debe ser un numero finito mayor a 0 (recibido: ${rawTarget}).`
+      );
+    }
+    targetBpm = Math.min(1000000, Math.max(0.01, parsedTarget));
+  }
+
+  return {
+    minBpm,
+    maxBpm,
+    preferIntegerBpm: options.snapBpm !== false,
+    sensitivity,
+    enableRubatoTracking: Boolean(options.rubato),
+    targetBpm,
+    startAtSec,
+    doubleBpm: Boolean(options.doubleBpm),
+    halfBpm: Boolean(options.halfBpm)
+  };
+}
+
+function findNearestOnsetBinary(sortedEvents, targetSec, maxToleranceSec) {
+  if (!sortedEvents || sortedEvents.length === 0) return null;
+
+  let low = 0;
+  let high = sortedEvents.length - 1;
+
+  while (low <= high) {
+    const mid = (low + high) >>> 1;
+    const midTime = sortedEvents[mid].timeSec;
+    if (midTime < targetSec) {
+      low = mid + 1;
+    } else if (midTime > targetSec) {
+      high = mid - 1;
+    } else {
+      return sortedEvents[mid];
+    }
+  }
+
+  let bestEv = null;
+  let bestDist = maxToleranceSec;
+
+  if (low < sortedEvents.length) {
+    const dRight = Math.abs(sortedEvents[low].timeSec - targetSec);
+    if (dRight < bestDist) {
+      bestDist = dRight;
+      bestEv = sortedEvents[low];
+    }
+  }
+  if (high >= 0) {
+    const dLeft = Math.abs(sortedEvents[high].timeSec - targetSec);
+    if (dLeft < bestDist) {
+      bestDist = dLeft;
+      bestEv = sortedEvents[high];
+    }
+  }
+
+  return bestEv;
+}
+
 export function analyzeTiming(features, options = {}) {
-  let minBpm = options.minBpm || 60;
-  let maxBpm = options.maxBpm || 260;
-  const preferIntegerBpm = options.snapBpm !== false;
-  const sensitivity = options.sensitivity ?? 0.5;
-  const enableRubatoTracking = Boolean(options.rubato);
-  let targetBpm = options.bpm || options.targetBpm || null;
-  const startAtSec = Math.max(0, Number(options.startAt || options.skipIntro || 0));
+  if (!features || !features.onsetEnv || features.onsetEnv.length === 0) {
+    throw new Error('Las caracteristicas de audio (features.onsetEnv) estan vacias o son invalidas.');
+  }
+
+  const sanitized = sanitizeAnalyzeOptions(options);
+  let { minBpm, maxBpm, preferIntegerBpm, sensitivity, enableRubatoTracking, targetBpm, startAtSec } =
+    sanitized;
 
   const {
     onsetEnv,
     lowOnsetEnv,
     midOnsetEnv,
     highOnsetEnv,
-    onsetEvents,
+    onsetEvents = [],
     frameRate,
     sampleRate,
     hopSize
   } = features;
 
-  const totalDurationSec = (onsetEnv.length * hopSize) / sampleRate;
-  const startFrame = Math.min(onsetEnv.length - 1, Math.round(startAtSec * frameRate));
+  const totalDurationSec = Math.max(0.01, (onsetEnv.length * hopSize) / sampleRate);
+  const startFrame = Math.max(0, Math.min(onsetEnv.length - 1, Math.round(startAtSec * frameRate)));
 
   // Calculo de candidatos globales con discriminacion armonica y asimetria de octava
   // Si el usuario especifico startAtSec, el analisis se enfoca desde el drop/ritmo principal
@@ -150,7 +235,7 @@ export function analyzeTiming(features, options = {}) {
     hasRubato,
     tempoCharacter: classifyTempoCharacter(uniqueBpms.size, uniqueMeters.size, hasPhaseResets, hasRubato),
     primaryBpm: primaryPoint.bpm,
-    initialOffsetMs: timingPoints[0].offsetMs,
+    initialOffsetMs: timingPoints[0]?.offsetMs ?? 0,
     primaryMeter: `${primaryPoint.meter}/4`,
     confidence: primaryPoint.confidence,
     candidates: candidateList,
@@ -652,31 +737,49 @@ function estimateWindowBpm(
 }
 
 function computeOctaveAsymmetry(events, bpm, startSec, endSec) {
+  if (!Number.isFinite(bpm) || bpm <= 0) {
+    return { maxAsymmetry: 1.0, meanEven: 1, meanOdd: 1 };
+  }
   const period = 60.0 / bpm;
-  if (!events || events.length === 0 || period <= 0) {
+  if (!events || events.length === 0 || !Number.isFinite(period) || period <= 0) {
     return { maxAsymmetry: 1.0, meanEven: 1, meanOdd: 1 };
   }
 
   const res = evaluateExactBpmAndPhase(events, startSec, endSec, bpm);
-  const phaseSec = res.phaseSec;
+  const phaseSec = Number.isFinite(res.phaseSec) ? res.phaseSec : startSec;
   const tol = Math.min(0.040, period * 0.22);
 
   let evenBass = 0, evenCount = 0;
   let oddBass = 0, oddCount = 0;
 
-  for (let t = phaseSec; t <= endSec - tol; t += period) {
+  const maxSteps = Math.min(50000, Math.floor((endSec - tol - phaseSec) / period) + 1);
+  for (let step = 0; step < maxSteps; step++) {
+    const t = phaseSec + step * period;
     if (t < startSec) continue;
-    const beatIdx = Math.round((t - phaseSec) / period);
-    const isEven = beatIdx % 2 === 0;
+    const isEven = step % 2 === 0;
+
+    // Busqueda binaria O(log N) del rango de eventos en [t - tol, t + tol]
+    let low = 0;
+    let high = events.length - 1;
+    let startIdx = events.length;
+    const minT = t - tol;
+    const maxT = t + tol;
+
+    while (low <= high) {
+      const mid = (low + high) >>> 1;
+      if (events[mid].timeSec >= minT) {
+        startIdx = mid;
+        high = mid - 1;
+      } else {
+        low = mid + 1;
+      }
+    }
 
     let maxBass = 0;
-    for (let i = 0; i < events.length; i++) {
+    for (let i = startIdx; i < events.length && events[i].timeSec <= maxT; i++) {
       const ev = events[i];
-      const dt = Math.abs(ev.timeSec - t);
-      if (dt <= tol) {
-        const bass = ev.lowStrength * 2.5 + ev.midStrength * 1.2;
-        if (bass > maxBass) maxBass = bass;
-      }
+      const bass = ev.lowStrength * 2.5 + ev.midStrength * 1.2;
+      if (bass > maxBass) maxBass = bass;
     }
 
     if (isEven) {
@@ -999,8 +1102,11 @@ function refineBpmViaLinearRegression(events, initialBpm, initialPhaseSec, start
     intercept = (sumWT - slope * sumWK) / sumW;
   }
 
+  if (!Number.isFinite(slope) || slope <= 0) {
+    return { valid: false, bpm: initialBpm, phaseSec: initialPhaseSec };
+  }
   const newBpm = 60.0 / slope;
-  if (Math.abs(newBpm - initialBpm) > 1.5) {
+  if (!Number.isFinite(newBpm) || newBpm <= 0 || Math.abs(newBpm - initialBpm) > 1.5) {
     return { valid: false, bpm: initialBpm, phaseSec: initialPhaseSec };
   }
 
@@ -1248,33 +1354,40 @@ function buildBeatGridForSegment(
   segEvents,
   frameRate
 ) {
+  if (!Number.isFinite(beatPeriodSec) || beatPeriodSec <= 0 || endSec < startSec) {
+    return [];
+  }
+
   let firstActiveTime = startSec;
   if (segEvents.length > 0) {
-    const firstStrong = segEvents.find((e) => e.timeSec >= startSec && (e.strength > 0.15 || e.lowStrength > 0.12));
+    const firstStrong = segEvents.find(
+      (e) => e.timeSec >= startSec && (e.strength > 0.15 || e.lowStrength > 0.12)
+    );
     if (firstStrong && firstStrong.timeSec < startSec + 8.0) {
       firstActiveTime = Math.max(startSec, firstStrong.timeSec - beatPeriodSec * 0.25);
     }
   }
 
-  let firstBeatSec = phaseSec;
-  while (firstBeatSec - beatPeriodSec >= firstActiveTime) {
-    firstBeatSec -= beatPeriodSec;
+  const safePhaseSec = Number.isFinite(phaseSec) ? phaseSec : firstActiveTime;
+  const stepsDelta = Math.ceil((firstActiveTime - safePhaseSec) / beatPeriodSec);
+  const firstBeatSec = safePhaseSec + stepsDelta * beatPeriodSec;
+
+  const MAX_GRID_BEATS = 50000;
+  const rawBeatCount = Math.floor((endSec + 0.02 - firstBeatSec) / beatPeriodSec) + 1;
+  if (!Number.isFinite(rawBeatCount) || rawBeatCount <= 0) {
+    return [];
   }
-  while (firstBeatSec < firstActiveTime) {
-    firstBeatSec += beatPeriodSec;
-  }
+  const stride = rawBeatCount > MAX_GRID_BEATS ? Math.ceil(rawBeatCount / MAX_GRID_BEATS) : 1;
+  const effectiveStepSec = beatPeriodSec * stride;
+  const numSteps = Math.max(
+    0,
+    Math.min(MAX_GRID_BEATS, Math.floor((endSec + 0.02 - firstBeatSec) / effectiveStepSec) + 1)
+  );
 
   const beats = [];
-  for (let t = firstBeatSec; t <= endSec + 0.02; t += beatPeriodSec) {
-    let nearestEv = null;
-    let minDiff = 0.04;
-    for (const ev of segEvents) {
-      const d = Math.abs(ev.timeSec - t);
-      if (d < minDiff) {
-        minDiff = d;
-        nearestEv = ev;
-      }
-    }
+  for (let idx = 0; idx < numSteps; idx++) {
+    const t = firstBeatSec + idx * effectiveStepSec;
+    const nearestEv = findNearestOnsetBinary(segEvents, t, 0.04);
 
     const fIdx = Math.round(t * frameRate - 1.44);
     const low = nearestEv
@@ -1875,27 +1988,30 @@ function detectInternalMeterChanges(seg, features, sensitivity = 0.5) {
 }
 
 function buildOsuTimingPoints(segments, totalDurationSec) {
-  if (segments.length === 0) return [];
+  if (!Array.isArray(segments) || segments.length === 0) return [];
 
   // Si el primer Timing Point empieza despues de una intro (ej. en el drop a los 30s),
-  // retro-proyectamos el compas hacia atras para que la linea roja cubra desde el inicio (t >= 0)
+  // retro-proyectamos el compas hacia atras en O(1) para que la linea roja cubra desde el inicio (t >= 0)
   const firstSeg = segments[0];
-  const barMs = (60000.0 / firstSeg.bpm) * (firstSeg.meter || 4);
-  if (firstSeg.offsetMs > barMs) {
-    let retroOffset = firstSeg.offsetMs;
-    while (retroOffset - barMs >= 0) {
-      retroOffset -= barMs;
-    }
-    firstSeg.offsetMs = Math.round(retroOffset);
+  const safeFirstBpm = Number.isFinite(firstSeg.bpm) && firstSeg.bpm > 0 ? firstSeg.bpm : 120;
+  const safeFirstMeter =
+    Number.isFinite(firstSeg.meter) && firstSeg.meter >= 1 ? Math.trunc(firstSeg.meter) : 4;
+  const barMs = (60000.0 / safeFirstBpm) * safeFirstMeter;
+  if (Number.isFinite(barMs) && barMs > 0 && firstSeg.offsetMs > barMs) {
+    const barsToSubtract = Math.floor(firstSeg.offsetMs / barMs);
+    firstSeg.offsetMs = Math.round(firstSeg.offsetMs - barsToSubtract * barMs);
   }
 
   return segments.map((seg, idx) => {
-    const beatLength = 60000.0 / seg.bpm;
-    const offsetMs = seg.offsetMs;
-    const endMs = idx + 1 < segments.length ? segments[idx + 1].offsetMs : Math.round(totalDurationSec * 1000);
-    const meter = seg.meter || 4;
+    const safeBpm = Number.isFinite(seg.bpm) && seg.bpm > 0 ? seg.bpm : 120;
+    const beatLength = 60000.0 / safeBpm;
+    const offsetMs = Number.isFinite(seg.offsetMs) ? seg.offsetMs : 0;
+    const endMs =
+      idx + 1 < segments.length ? segments[idx + 1].offsetMs : Math.round(totalDurationSec * 1000);
+    const meter = Number.isFinite(seg.meter) && seg.meter >= 1 ? Math.trunc(seg.meter) : 4;
 
-    const osuLine = `${offsetMs},${beatLength.toFixed(12).replace(/\.?0+$/, '')},${meter},2,0,100,1,0`;
+    const formattedBeatLength = Number(beatLength.toFixed(12)).toString();
+    const osuLine = `${offsetMs},${formattedBeatLength},${meter},2,0,100,1,0`;
 
     return {
       index: idx + 1,
@@ -1903,11 +2019,11 @@ function buildOsuTimingPoints(segments, totalDurationSec) {
       endMs,
       startTimeFormatted: formatMsToTimestamp(offsetMs),
       endTimeFormatted: formatMsToTimestamp(endMs),
-      bpm: seg.bpm,
+      bpm: safeBpm,
       beatLengthMs: Number(beatLength.toFixed(6)),
       meter,
       timeSignature: `${meter}/4`,
-      confidence: Number((seg.confidence * 100).toFixed(1)),
+      confidence: Number(((seg.confidence || 0) * 100).toFixed(1)),
       driftRmseMs: seg.driftRmseMs ?? 0,
       changeType: idx === 0 ? 'initial' : seg.changeType || 'tempo_change',
       osuTimingPointLine: osuLine
@@ -1917,9 +2033,12 @@ function buildOsuTimingPoints(segments, totalDurationSec) {
 
 function computeMapperDiagnostics(timingPoints, onsetEvents, totalDurationSec) {
   const avgDriftRmseMs =
-    timingPoints.reduce((acc, tp) => acc + (tp.driftRmseMs || 0), 0) / Math.max(1, timingPoints.length);
+    timingPoints.reduce((acc, tp) => acc + (tp.driftRmseMs || 0), 0) /
+    Math.max(1, timingPoints.length);
 
-  const firstOnsetMs = onsetEvents.length > 0 ? Math.round(onsetEvents[0].timeMs) : timingPoints[0].offsetMs;
+  const fallbackOffset = timingPoints.length > 0 ? timingPoints[0].offsetMs : 0;
+  const firstOnsetMs =
+    onsetEvents && onsetEvents.length > 0 ? Math.round(onsetEvents[0].timeMs) : fallbackOffset;
   const audioLeadInRecommendedMs = firstOnsetMs < 1200 ? Math.max(0, 1500 - firstOnsetMs) : 0;
 
   let syncQuality = 'EXCELENTE (Precision de Ranking < 5 ms)';
@@ -1938,6 +2057,9 @@ function computeMapperDiagnostics(timingPoints, onsetEvents, totalDurationSec) {
 }
 
 function selectPrimaryTimingPoint(timingPoints, totalDurationSec) {
+  if (!timingPoints || timingPoints.length === 0) {
+    return { bpm: 120, offsetMs: 0, meter: 4, confidence: 0 };
+  }
   if (timingPoints.length === 1) return timingPoints[0];
 
   let bestTp = timingPoints[0];
