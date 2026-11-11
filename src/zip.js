@@ -1,3 +1,4 @@
+import path from 'node:path';
 import zlib from 'node:zlib';
 
 /**
@@ -5,6 +6,10 @@ import zlib from 'node:zlib';
  * Compatible con la especificacion ZIP standard y descompresion nativa de osu! (.NET / SharpZipLib).
  */
 export function createZipArchive(files) {
+  if (!Array.isArray(files) || files.length === 0) {
+    throw new Error('Se requiere al menos un archivo para crear el paquete ZIP/OSZ.');
+  }
+
   const localEntries = [];
   const centralEntries = [];
   let offset = 0;
@@ -14,9 +19,16 @@ export function createZipArchive(files) {
   const dosDate = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
 
   for (const file of files) {
-    const nameBuf = Buffer.from(file.name, 'utf8');
-    const rawData = Buffer.isBuffer(file.data) ? file.data : Buffer.from(file.data, 'utf8');
+    if (!file || typeof file.name !== 'string' || !file.name.trim()) {
+      throw new Error('Cada entrada del archivo ZIP debe tener un nombre válido.');
+    }
+    const safeFileName = path.basename(file.name.replace(/\\/g, '/'));
+    const nameBuf = Buffer.from(safeFileName, 'utf8');
+    const rawData = Buffer.isBuffer(file.data) ? file.data : Buffer.from(String(file.data ?? ''), 'utf8');
     const uncompressedSize = rawData.length;
+    if (uncompressedSize > 0xffffffff) {
+      throw new RangeError(`El archivo '${safeFileName}' excede el límite de 4GB del formato ZIP estándar.`);
+    }
     const crc = zlib.crc32(rawData);
 
     // Comprimir con DEFLATE; si es un archivo de audio ya comprimido (como MP3/OGG) y no reduce tamano,

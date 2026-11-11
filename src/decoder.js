@@ -77,61 +77,89 @@ function decodeWithFFmpeg(filePath, sampleRate) {
   });
 }
 
-function decodeWavFallback(filePath) {
+export function decodeWavFallback(filePath) {
   const buffer = fs.readFileSync(filePath);
-  if (buffer.toString('ascii', 0, 4) !== 'RIFF' || buffer.toString('ascii', 8, 12) !== 'WAVE') {
-    throw new Error('Formato WAV inválido.');
+  if (
+    buffer.length < 44 ||
+    buffer.toString('ascii', 0, 4) !== 'RIFF' ||
+    buffer.toString('ascii', 8, 12) !== 'WAVE'
+  ) {
+    throw new Error('Formato WAV inválido o archivo truncado (< 44 bytes).');
   }
 
   let offset = 12;
-  let numChannels = 1;
-  let sampleRate = 44100;
-  let bitsPerSample = 16;
+  let numChannels = 0;
+  let sampleRate = 0;
+  let bitsPerSample = 0;
   let audioFormat = 1;
   let dataOffset = -1;
   let dataSize = 0;
 
-  while (offset < buffer.length - 8) {
+  while (offset <= buffer.length - 8) {
     const chunkId = buffer.toString('ascii', offset, offset + 4);
     const chunkSize = buffer.readUInt32LE(offset + 4);
     if (chunkId === 'fmt ') {
+      if (offset + 8 + chunkSize > buffer.length || chunkSize < 16) {
+        throw new Error('Bloque fmt corrupto o truncado en el archivo WAV.');
+      }
       audioFormat = buffer.readUInt16LE(offset + 8);
       numChannels = buffer.readUInt16LE(offset + 10);
       sampleRate = buffer.readUInt32LE(offset + 12);
       bitsPerSample = buffer.readUInt16LE(offset + 22);
     } else if (chunkId === 'data') {
       dataOffset = offset + 8;
-      dataSize = chunkSize;
+      dataSize = Math.min(chunkSize, Math.max(0, buffer.length - dataOffset));
       break;
     }
-    offset += 8 + chunkSize + (chunkSize % 2);
+    const nextOffset = offset + 8 + chunkSize + (chunkSize % 2);
+    if (nextOffset <= offset) break;
+    offset = nextOffset;
   }
 
-  if (dataOffset === -1) {
+  if (numChannels <= 0 || numChannels > 32) {
+    throw new RangeError(`Número de canales WAV inválido: ${numChannels}`);
+  }
+  if (sampleRate <= 0 || sampleRate > 384000) {
+    throw new RangeError(`Sample rate WAV inválido: ${sampleRate}`);
+  }
+  if (![8, 16, 24, 32].includes(bitsPerSample)) {
+    throw new RangeError(`Bits por muestra no soportados: ${bitsPerSample}`);
+  }
+  if (dataOffset === -1 || dataSize <= 0) {
     throw new Error('No se encontró el bloque de datos en el archivo WAV.');
   }
 
   const bytesPerSample = bitsPerSample / 8;
   const blockAlign = numChannels * bytesPerSample;
-  const totalFrames = Math.floor(dataSize / blockAlign);
+  const availableBytes = Math.min(dataSize, buffer.length - dataOffset);
+  const totalFrames = Math.floor(availableBytes / blockAlign);
+
+  if (totalFrames <= 0) {
+    throw new Error('El archivo WAV no contiene frames de audio completos.');
+  }
+
   const samples = new Float32Array(totalFrames);
 
   for (let i = 0; i < totalFrames; i++) {
     let sum = 0;
     for (let ch = 0; ch < numChannels; ch++) {
       const samplePos = dataOffset + i * blockAlign + ch * bytesPerSample;
+      let val = 0;
       if (audioFormat === 3 && bitsPerSample === 32) {
-        sum += buffer.readFloatLE(samplePos);
+        val = buffer.readFloatLE(samplePos);
       } else if (bitsPerSample === 16) {
-        sum += buffer.readInt16LE(samplePos) / 32768.0;
+        val = buffer.readInt16LE(samplePos) / 32768.0;
       } else if (bitsPerSample === 24) {
         const b0 = buffer[samplePos];
         const b1 = buffer[samplePos + 1];
         const b2 = buffer[samplePos + 2];
-        const val = (b2 << 24) | (b1 << 16) | (b0 << 8);
-        sum += (val >> 8) / 8388608.0;
+        const signed = (b2 << 24) | (b1 << 16) | (b0 << 8);
+        val = (signed >> 8) / 8388608.0;
       } else if (bitsPerSample === 8) {
-        sum += (buffer.readUInt8(samplePos) - 128) / 128.0;
+        val = (buffer.readUInt8(samplePos) - 128) / 128.0;
+      }
+      if (Number.isFinite(val)) {
+        sum += Math.max(-1.0, Math.min(1.0, val));
       }
     }
     samples[i] = sum / numChannels;

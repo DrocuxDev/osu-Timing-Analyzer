@@ -5,8 +5,8 @@
 
 export class FFT {
   constructor(size) {
-    if ((size & (size - 1)) !== 0) {
-      throw new Error(`El tamaño de FFT debe ser potencia de 2 (recibido: ${size})`);
+    if (!Number.isInteger(size) || size < 2 || (size & (size - 1)) !== 0) {
+      throw new RangeError(`El tamaño de FFT debe ser un entero potencia de 2 >= 2 (recibido: ${size})`);
     }
     this.size = size;
     this.reverseTable = new Uint32Array(size);
@@ -23,7 +23,9 @@ export class FFT {
       bit >>= 1;
     }
 
-    for (let i = 0; i < size; i++) {
+    this.sinTable[0] = 0.0;
+    this.cosTable[0] = 1.0;
+    for (let i = 1; i < size; i++) {
       this.sinTable[i] = Math.sin(-Math.PI / i);
       this.cosTable[i] = Math.cos(-Math.PI / i);
     }
@@ -117,7 +119,8 @@ export function extractMultiBandOnsets(samples, sampleRate, frameSize = 1024, ho
     let sumSq = 0;
 
     for (let i = 0; i < frameSize; i++) {
-      const s = samples[startIdx + i] || 0;
+      const rawSample = samples[startIdx + i];
+      const s = Number.isFinite(rawSample) ? rawSample : 0.0;
       sumSq += s * s;
       real[i] = s * window[i];
       imag[i] = 0.0;
