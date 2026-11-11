@@ -95,7 +95,10 @@ function openNativeFileDialog() {
         ).trim();
       }
     }
-  } catch {
+  } catch (err) {
+    if (process.env.DEBUG) {
+      console.error(`[DEBUG] Selector nativo no disponible: ${err.message}`);
+    }
     return null;
   }
 }
@@ -112,8 +115,10 @@ function copyToClipboard(text) {
       execFileSync('pbcopy', [], { input: text, encoding: 'utf8', stdio: ['pipe', 'ignore', 'ignore'] });
       return true;
     }
-  } catch {
-    // Ignorar si no esta disponible
+  } catch (err) {
+    if (process.env.DEBUG) {
+      console.error(`[DEBUG] Portapapeles no disponible: ${err.message}`);
+    }
   }
   return false;
 }
@@ -252,12 +257,12 @@ async function runInteractiveMode(options) {
           } else if (action === 'b') {
             const bpmInput = (await askQuestion(rl, '\nIngresa el BPM deseado (ej. 154 o 174.5): ')).trim();
             const parsedBpm = parseFloat(bpmInput);
-            if (!isNaN(parsedBpm) && parsedBpm >= 30 && parsedBpm <= 450) {
+            if (Number.isFinite(parsedBpm) && parsedBpm >= 0.01 && parsedBpm <= 1000000) {
               console.log(`\n[...] Recalculando con BPM fijado en ${parsedBpm}...`);
               const reRes = await analyzeAndShow(currentAudio, { ...options, targetBpm: parsedBpm });
               if (reRes) currentAnalysis = reRes.analysis;
             } else {
-              console.log('\n[!] Valor de BPM invalido (debe ser un numero entre 30 y 450).');
+              console.log('\n[!] Valor de BPM invalido (debe ser un numero finito mayor a 0).');
             }
           } else if (action === 'i') {
             const secInput = (await askQuestion(rl, '\nIngresa el segundo donde entra el ritmo o drop (ej. 30 o 45): ')).trim();
@@ -321,19 +326,44 @@ async function main() {
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if ((arg === '--bpm' || arg === '-b') && i + 1 < args.length) {
-      options.targetBpm = Number(args[++i]);
+      const val = Number(args[++i]);
+      if (!Number.isFinite(val) || val <= 0) {
+        console.error(`[ERROR] Valor invalido para --bpm: "${args[i]}". Debe ser un numero > 0.`);
+        process.exit(1);
+      }
+      options.targetBpm = val;
     } else if (arg === '--double' || arg === '-d') {
       options.doubleBpm = true;
     } else if (arg === '--half' || arg === '-m') {
       options.halfBpm = true;
     } else if ((arg === '--start-at' || arg === '--skip-intro' || arg === '-i') && i + 1 < args.length) {
-      options.startAt = Number(args[++i]);
+      const val = Number(args[++i]);
+      if (!Number.isFinite(val) || val < 0) {
+        console.error(`[ERROR] Valor invalido para --start-at: "${args[i]}". Debe ser un segundo >= 0.`);
+        process.exit(1);
+      }
+      options.startAt = val;
     } else if (arg === '--min-bpm' && i + 1 < args.length) {
-      options.minBpm = Number(args[++i]);
+      const val = Number(args[++i]);
+      if (!Number.isFinite(val) || val <= 0) {
+        console.error(`[ERROR] Valor invalido para --min-bpm: "${args[i]}". Debe ser un numero > 0.`);
+        process.exit(1);
+      }
+      options.minBpm = val;
     } else if (arg === '--max-bpm' && i + 1 < args.length) {
-      options.maxBpm = Number(args[++i]);
+      const val = Number(args[++i]);
+      if (!Number.isFinite(val) || val <= 0) {
+        console.error(`[ERROR] Valor invalido para --max-bpm: "${args[i]}". Debe ser un numero > 0.`);
+        process.exit(1);
+      }
+      options.maxBpm = val;
     } else if (arg === '--sensitivity' && i + 1 < args.length) {
-      options.sensitivity = Math.max(0, Math.min(1, Number(args[++i])));
+      const val = Number(args[++i]);
+      if (!Number.isFinite(val)) {
+        console.error(`[ERROR] Valor invalido para --sensitivity: "${args[i]}".`);
+        process.exit(1);
+      }
+      options.sensitivity = Math.max(0, Math.min(1, val));
     } else if (arg === '--no-snap') {
       options.snapBpm = false;
     } else if (arg === '--rubato') {
